@@ -3,6 +3,8 @@ name: OEM GSI Builder
 on:
   workflow_dispatch:
 
+concurrency: gsi-build
+
 defaults:
   run:
     shell: bash
@@ -10,50 +12,131 @@ defaults:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
+
       - name: Load Configuration
-        uses: falti/dotenv-action@v0.2.5
         id: config
-        with:
+        run: |
+          if [[ ! -f config.env ]]; then
+            echo "config.env not found in repository root." && exit 1
+          fi
+          # Parse config.env KEY=VALUE (or key=value). Comments (#) and blank
+          # lines are ignored. Replaces the removed Node-12 dotenv action.
+          while IFS='=' read -r k v; do
+            k="${k#"${k%%[![:space:]]*}"}"     # trim leading whitespace
+            [[ -z "$k" || "$k" == \#* ]] && continue
+            [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+            v="${v#"${v%%[![:space:]]*}"}"     # trim leading whitespace
+            v="${v%"${v##*[![:space:]]}"}"     # trim trailing whitespace
+            [[ "$v" == \"*\" || "$v" == \'*\' ]] && v="${v:1:${#v}-2}"  # strip quotes
+            echo "${k,,}=${v}" >> "$GITHUB_OUTPUT"
+          done < <(grep -vE '^\s*(#|$)' config.env)
+          echo "::group::Loaded settings"
+          for o in tool_repo url firmware_type sourceforge_dir output_type; do
+            printf '  %-15s = %s\n' "$o" "${!o:-}"
+          done
+          echo "::endgroup::"
+
+      - name: Check Configuration
+        env:
+          G_USERNAME: ${{ secrets.USERNAME }}
+          G_PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          required() {
+            if [[ -z "$1" ]]; then echo "$2 variable can't be null." && exit 1; fi
+          }
+          required "$G_USERNAME" "USERNAME secret"
+          required "$G_PASSWORD" "PASSWORD secret"
+          required "${{ steps.config.outputs.tool_repo }}" "TOOL_REPO config"
+          required "${{ steps.config.outputs.url }}" "URL config"
+          required "${{ steps.config.outputs.firmware_type }}" "FIRMWARE_TYPE config"
+          required "${{ steps.config.outputs.sourceforge_dir }}" "SOURCEFORGE_DIR config"
+          required "${{ steps.config.outputs.output_type }}" "OUTPUT_TYPE config"
+
+      - name: Install System Dependencies (Ubuntu 24.04)
+        run: |
+          sudo apt-get update -y
+          # Base package set present on Ubuntu 24.04 (node12-era runners are gone,
+          # openjdk-8 was removed from repos -> use 17 as fallback for signapk)
+          sudo apt-get install -y --no-install-recommends \
+            pv zip unzip cpio lz4 xz-utils zstd brotli e2fsprogs erofs-utils \
+            curl wget openssl python3 zlib1g-dev \
+            openjdk-17-jdk-headless \
+          || true
+          # Individual critical tools must really exist:
+          for t in pv zip unzip cpio lz4 zipalign; do
+            command -v "$t" >/dev/null || sudo apt-get install -y "$t" || true
+          done
+
       - name: Setup ErfanGSIs Tools
         run: |
           git clone --recurse-submodules "${{ steps.config.outputs.tool_repo }}"
-          python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install pycryptodome
-          sed -i 's/pycrypto/pycryptodome/g' ErfanGSIs/requirements.txt || true
           bash ErfanGSIs/setup.sh
-          sed -i 's/' ErfanGSIs/url2GSI.sh
+          sed -i '$d' ErfanGSIs/url2GSI.sh
 
       - name: Build A/B
         if: ${{ steps.config.outputs.output_type == 'all' }}
         run: |
-          sudo ./ErfanGSIs/url2GSI.sh "${{ steps.config.outputs.url }}" "${{ steps.config.outputs.firmware_type }}" "${{ steps.config.outputs.extra_args }}"
+          sudo ./ErfanGSIs/url2GSI.sh "${{ steps.config.outputs.url }}" "${{ steps.config.outputs.firmware_type }}" ${{ steps.config.outputs.extra_args }}
+
       - name: Build AB
         if: ${{ steps.config.outputs.output_type == 'ab' }}
         run: |
           sudo ./ErfanGSIs/url2GSI.sh "${{ steps.config.outputs.url }}" "${{ steps.config.outputs.firmware_type }}" --ab ${{ steps.config.outputs.extra_args }}
+
       - name: Build AOnly
         if: ${{ steps.config.outputs.output_type == 'a' }}
         run: |
           sudo ./ErfanGSIs/url2GSI.sh "${{ steps.config.outputs.url }}" "${{ steps.config.outputs.firmware_type }}" --aonly ${{ steps.config.outputs.extra_args }}
+
       - name: Pre-Upload
         run: |
           mkdir build/
           sudo mv ErfanGSIs/output/*.img build/
           gzip -r build/
           sudo mv ErfanGSIs/output/*.txt build/
-      - name: Tạo Bản Phát Hành và Đẩy File Lên GitHub
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: "gsi-build-${{ github.run_number }}"
-          name: "Bản ROM GSI Build Số #${{ github.run_number }}"
-          body: |
-            Tự động build thành công bằng GitHub Actions!
-          files: |
-            ErfanGSIs/output/*.img
-            ErfanGSIs/output/*.txt
+
+      - name: Setup SSH
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          if [[ -z "$SSH_KEY" ]]; then echo "SSH_KEY secret missing." && exit 1; fi
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/id_ecdsa"
+          chmod 600 "$HOME/.ssh/id_ecdsa"
+          echo "SSH key installed."
+
+      - name: Upload
+        env:
+          SF_USERNAME: ${{ secrets.USERNAME }}
+          SF_PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          ssh-keyscan frs.sourceforge.net >> ~/.ssh/known_hosts 2>/dev/null
+          sshpass -p "$SF_PASSWORD" rsync -arsP -e ssh \
+            build/ "$SF_USERNAME@frs.sourceforge.net:${{ steps.config.outputs.sourceforge_dir }}"
+
+      - name: Telegram Notify
+        if: ${{ steps.config.outputs.tg_chat_ids != 0 }}
+        env:
+          BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          CHAT_IDS="${{ steps.config.outputs.tg_chat_ids }}"
+          TG_URL="https://api.telegram.org/bot$BOT_TOKEN/sendMessage"
+
+          # Accept ids as space or comma separated list
+          chatids=(${CHAT_IDS//,/ })
+
+          for chat in "${chatids[@]}"; do
+            BASE="${{ steps.config.outputs.url }}"
+            SOURCEFORGE="${{ steps.config.outputs.sourceforge_url }}"
+            for file in build/*.txt; do
+              filename=$(basename -- "$file")
+              sed -i "1s/^/Name: ${filename%.*}\n/" "$file"
+              printf "\n\nBase Firmware Link: $BASE" >> "$file"
+              printf "\n\nDownload Link: $SOURCEFORGE" >> "$file"
+              curl -s -d "chat_id=$chat" --data-urlencode "text@$file" "$TG_URL"
+            done
+          done
